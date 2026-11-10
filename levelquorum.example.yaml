@@ -1,0 +1,58 @@
+# LevelQuorum example configuration.
+# Run with:  levelquorum -config levelquorum.example.yaml
+# Every setting is optional; the values shown for the top-level settings are
+# the defaults.
+
+# Address to serve the Redis protocol on. There is no authentication yet, so
+# only listen on an address that untrusted clients cannot reach.
+listen: "127.0.0.1:6380"
+
+# Directory for the database. Use a local NVMe disk in production.
+data_dir: "data"
+
+# RAM for the cache of data blocks read from disk, shared by all namespaces.
+block_cache_size: 256MB
+
+# In-memory write buffer per namespace. Each namespace can hold up to a few
+# of these in RAM.
+write_buffer_size: 64MB
+
+# Largest key or value a client may send.
+max_bulk_size: 64MB
+
+# A namespace owns every key that starts with its prefix; the longest
+# matching prefix wins. Keys that match no prefix go to the "default"
+# namespace, which is a 1GB cache unless it is defined here.
+#
+# profile decides how the data is treated:
+#   cache   acknowledged once applied; the oldest data is evicted when the
+#           namespace reaches max_size (required for this profile).
+#   safe    never evicted. Survives a crash of the server process.
+#   strict  never evicted, and written to disk (fsync) before the client
+#           gets its OK. Survives power loss. Slowest.
+#
+# Sizes take the units KB, MB, GB, TB. Durations take s, m, h, d.
+#
+# Define namespaces before writing keys under their prefix. A namespace's
+# prefix cannot be changed later, and it cannot switch between cache and a
+# durable profile (safe <-> strict is fine).
+namespaces:
+  - name: default
+    prefix: ""
+    profile: cache
+    max_size: 10GB
+
+  - name: sessions
+    prefix: "session:"
+    profile: cache
+    max_size: 100GB
+    # Applied to writes that do not set their own expiry.
+    default_ttl: 24h
+
+  - name: users
+    prefix: "user:"
+    profile: safe
+
+  - name: orders
+    prefix: "orders:"
+    profile: strict
