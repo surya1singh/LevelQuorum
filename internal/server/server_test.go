@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http/httptest"
 	"reflect"
 	"strconv"
 	"strings"
@@ -44,6 +45,7 @@ func start(t *testing.T) *harness {
 		Dir:             t.TempDir(),
 		WriteBufferSize: 1 << 20,
 		BlockCacheSize:  8 << 20,
+		HotCacheSize:    16 << 20, // on, as in the default configuration
 		Now:             clock.Now,
 		Logger:          quiet(),
 		Namespaces: []storage.NamespaceSpec{
@@ -531,6 +533,11 @@ func TestNamespacesAndDurability(t *testing.T) {
 	if m := got["default"]; m["profile"] != "cache" || m["prefix"] != "" {
 		t.Errorf("default namespace = %v", m)
 	}
+	// A durable namespace is one column family; a cache namespace is a
+	// series of buckets and starts with one.
+	if got["orders"]["buckets"] != i64+1 || got["sessions"]["buckets"] != i64+1 {
+		t.Errorf("buckets: orders=%v sessions=%v; want 1 and 1", got["orders"]["buckets"], got["sessions"]["buckets"])
+	}
 
 	c.want("cache", "DURABILITY")
 	c.want("OK", "DURABILITY", "strict")
@@ -562,6 +569,10 @@ func TestInfoAndDBSize(t *testing.T) {
 		"connected_clients:1",
 		`namespace_orders:prefix="orders:",profile=strict`,
 		`namespace_sessions:prefix="session:",profile=cache,max_size=67108864,default_ttl_ms=3600000`,
+		"buckets=1,evicted_buckets=0,promotions=0",
+		"total_commands_processed:11", // ten SETs and the DBSIZE; INFO itself is counted after it replies
+		"hot_cache_entries:10",
+		"hot_cache_capacity_bytes:16777216",
 		"db0:keys=10",
 	} {
 		if !strings.Contains(info, want) {
@@ -587,5 +598,92 @@ func TestShutdown(t *testing.T) {
 	ent, err := h.eng.Get([]byte("orders:1"))
 	if err != nil || ent == nil || string(ent.Value) != "v" {
 		t.Fatalf("after Shutdown, Get = %+v, %v", ent, err)
+	}
+}
+
+// metricValue returns the value of the sample with exactly this name and
+// label set, or fails the test.
+func metricValue(t *testing.T, text, sample string) float64 {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		if rest, ok := strings.CutPrefix(line, sample+" "); ok {
+			v, err := strconv.ParseFloat(rest, 64)
+			if err != nil {
+				t.Fatalf("metric %s has value %q", sample, rest)
+			}
+			return v
+		}
+	}
+	t.Fatalf("metric %s not found in:\n%s", sample, text)
+	return 0
+}
+
+func TestMetrics(t *testing.T) {
+	h := start(t)
+	c := h.dial()
+	c.want("OK", "SET", "orders:1", "v")
+	for i := 0; i < 5; i++ {
+		c.want("v", "GET", "orders:1")
+	}
+	c.want(nil, "GET", "orders:missing")
+	c.wantErr("not an integer", "INCR", "orders:1")
+	c.wantErr("wrong number of arguments", "GET")
+	c.wantErr("unknown command", "NOSUCH")
+
+	rec := httptest.NewRecorder()
+	h.srv.MetricsHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	text := rec.Body.String()
+
+	for sample, want := range map[string]float64{
+		`levelquorum_commands_total{command="get"}`:                                  7,
+		`levelquorum_command_errors_total{command="get"}`:                            1,
+		`levelquorum_commands_total{command="set"}`:                                  1,
+		`levelquorum_command_errors_total{command="set"}`:                            0,
+		`levelquorum_command_errors_total{command="incr"}`:                           1,
+		`levelquorum_commands_total{command="unknown"}`:                              1,
+		`levelquorum_command_duration_seconds_count{command="get"}`:                  7,
+		`levelquorum_command_duration_seconds_bucket{command="get",le="+Inf"}`:       7,
+		`levelquorum_connected_clients`:                                              1,
+		`levelquorum_namespace_buckets{namespace="orders",profile="strict"}`:         1,
+		`levelquorum_namespace_max_size_bytes{namespace="sessions",profile="cache"}`: 64 << 20,
+		`levelquorum_hot_cache_entries`:                                              1,
+		`levelquorum_hot_cache_hits_total`:                                           6, // five GETs and the INCR
+		`levelquorum_hot_cache_misses_total`:                                         1, // the GET of a missing key
+		`levelquorum_hot_cache_capacity_bytes`:                                       16 << 20,
+	} {
+		if got := metricValue(t, text, sample); got != want {
+			t.Errorf("%s = %v; want %v", sample, got, want)
+		}
+	}
+	if sum := metricValue(t, text, `levelquorum_command_duration_seconds_sum{command="get"}`); sum <= 0 || sum > 5 {
+		t.Errorf("total GET time = %v seconds; want a small positive number", sum)
+	}
+	// Histogram buckets are cumulative.
+	prev := 0.0
+	for _, line := range strings.Split(text, "\n") {
+		if rest, ok := strings.CutPrefix(line, `levelquorum_command_duration_seconds_bucket{command="get",le=`); ok {
+			v, _ := strconv.ParseFloat(rest[strings.LastIndex(rest, " ")+1:], 64)
+			if v < prev {
+				t.Fatalf("histogram bucket decreases: %s", line)
+			}
+			prev = v
+		}
+	}
+	// Commands that were never called are not listed.
+	if strings.Contains(text, `command="mset"`) {
+		t.Error("metrics list a command that was never called")
+	}
+	// Every sample line must parse as "name[{labels}] number".
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		i := strings.LastIndex(line, " ")
+		if _, err := strconv.ParseFloat(line[i+1:], 64); i < 0 || err != nil || !strings.HasPrefix(line, "levelquorum_") {
+			t.Fatalf("malformed metrics line %q", line)
+		}
 	}
 }

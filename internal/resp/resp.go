@@ -145,6 +145,7 @@ func firstByte(b []byte) string {
 type Writer struct {
 	bw      *bufio.Writer
 	scratch []byte
+	errors  uint64
 }
 
 // NewWriter returns a buffered Writer; nothing reaches w until Flush.
@@ -154,6 +155,9 @@ func NewWriter(w io.Writer) *Writer {
 
 // Flush sends buffered replies to the client.
 func (w *Writer) Flush() error { return w.bw.Flush() }
+
+// ErrorCount returns how many error replies have been written.
+func (w *Writer) ErrorCount() uint64 { return w.errors }
 
 // SimpleString writes a status reply such as +OK. s must not contain CR or
 // LF.
@@ -166,6 +170,7 @@ func (w *Writer) SimpleString(s string) {
 // Error writes an error reply. By convention msg starts with an upper-case
 // code such as "ERR ". CR and LF are replaced so the reply stays one line.
 func (w *Writer) Error(msg string) {
+	w.errors++
 	w.bw.WriteByte('-')
 	for i := 0; i < len(msg); i++ {
 		c := msg[i]

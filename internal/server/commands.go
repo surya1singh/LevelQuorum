@@ -546,12 +546,25 @@ func cmdInfo(c *client, _ [][]byte) {
 	fmt.Fprintf(&b, "uptime_in_seconds:%d\r\n", int64(time.Since(s.started).Seconds()))
 	fmt.Fprintf(&b, "\r\n# Clients\r\n")
 	fmt.Fprintf(&b, "connected_clients:%d\r\n", s.clientCount())
+	fmt.Fprintf(&b, "\r\n# Stats\r\n")
+	fmt.Fprintf(&b, "total_commands_processed:%d\r\n", s.totalCommands())
+	fmt.Fprintf(&b, "\r\n# Memory\r\n")
+	fmt.Fprintf(&b, "block_cache_bytes:%d\r\n", s.eng.BlockCacheUsage())
+	if hot, ok := s.eng.HotStats(); ok {
+		fmt.Fprintf(&b, "hot_cache_bytes:%d\r\n", hot.Bytes)
+		fmt.Fprintf(&b, "hot_cache_capacity_bytes:%d\r\n", hot.Capacity)
+		fmt.Fprintf(&b, "hot_cache_entries:%d\r\n", hot.Entries)
+		fmt.Fprintf(&b, "hot_cache_hits:%d\r\n", hot.Hits)
+		fmt.Fprintf(&b, "hot_cache_misses:%d\r\n", hot.Misses)
+	} else {
+		fmt.Fprintf(&b, "hot_cache_capacity_bytes:0\r\n")
+	}
 	fmt.Fprintf(&b, "\r\n# Namespaces\r\n")
 	for _, st := range s.eng.Stats() {
 		keys += st.EstimatedKeys
-		fmt.Fprintf(&b, "namespace_%s:prefix=%q,profile=%s,max_size=%d,default_ttl_ms=%d,estimated_keys=%d,disk_bytes=%d,memtable_bytes=%d\r\n",
+		fmt.Fprintf(&b, "namespace_%s:prefix=%q,profile=%s,max_size=%d,default_ttl_ms=%d,estimated_keys=%d,disk_bytes=%d,memtable_bytes=%d,buckets=%d,evicted_buckets=%d,promotions=%d\r\n",
 			st.Spec.Name, st.Spec.Prefix, st.Spec.Profile, st.Spec.MaxSize, st.Spec.DefaultTTL.Milliseconds(),
-			st.EstimatedKeys, st.DiskBytes, st.MemtableBytes)
+			st.EstimatedKeys, st.DiskBytes, st.MemtableBytes, st.Buckets, st.EvictedBuckets, st.Promotions)
 	}
 	fmt.Fprintf(&b, "\r\n# Keyspace\r\n")
 	fmt.Fprintf(&b, "db0:keys=%d,expires=0,avg_ttl=0\r\n", keys)
@@ -567,7 +580,7 @@ func cmdNamespace(c *client, args [][]byte) {
 		stats := c.srv.eng.Stats()
 		c.w.ArrayLen(len(stats))
 		for _, st := range stats {
-			c.w.ArrayLen(14)
+			c.w.ArrayLen(16)
 			c.w.BulkString("name")
 			c.w.BulkString(st.Spec.Name)
 			c.w.BulkString("prefix")
@@ -582,6 +595,8 @@ func cmdNamespace(c *client, args [][]byte) {
 			c.w.Int(int64(st.EstimatedKeys))
 			c.w.BulkString("disk_bytes")
 			c.w.Int(int64(st.DiskBytes))
+			c.w.BulkString("buckets")
+			c.w.Int(int64(st.Buckets))
 		}
 	case sub == "FOR" && len(args) == 3:
 		c.w.BulkString(c.srv.eng.NamespaceOf(args[2]).Name)

@@ -10,7 +10,13 @@ listen: "127.0.0.1:6380"
 # Directory for the database. Use a local NVMe disk in production.
 data_dir: "data"
 
-# RAM for the cache of data blocks read from disk, shared by all namespaces.
+# RAM for recently used values, which are served without reading the
+# database. 0 turns it off.
+hot_cache_size: 128MB
+
+# RAM for RocksDB's cache of what it reads from disk, shared by all
+# namespaces. It also holds the indexes and bloom filters, so for large data
+# sets make it 2-5% of the data size.
 block_cache_size: 256MB
 
 # In-memory write buffer per namespace. Each namespace can hold up to a few
@@ -20,13 +26,19 @@ write_buffer_size: 64MB
 # Largest key or value a client may send.
 max_bulk_size: 64MB
 
+# Address to serve Prometheus metrics on, at /metrics. Off when empty. The
+# endpoint has no authentication.
+metrics_listen: ""
+
 # A namespace owns every key that starts with its prefix; the longest
 # matching prefix wins. Keys that match no prefix go to the "default"
 # namespace, which is a 1GB cache unless it is defined here.
 #
 # profile decides how the data is treated:
-#   cache   acknowledged once applied; the oldest data is evicted when the
-#           namespace reaches max_size (required for this profile).
+#   cache   acknowledged once applied. When the namespace reaches max_size
+#           (required for this profile), the data written longest ago and
+#           not read since is evicted, 1/16 of max_size at a time. Leave
+#           about 15% of disk free above max_size.
 #   safe    never evicted. Survives a crash of the server process.
 #   strict  never evicted, and written to disk (fsync) before the client
 #           gets its OK. Survives power loss. Slowest.

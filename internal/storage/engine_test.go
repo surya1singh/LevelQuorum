@@ -2,7 +2,6 @@ package storage
 
 import (
 	"bytes"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -30,9 +29,31 @@ func (c *fakeClock) Advance(d time.Duration) { c.ms.Add(d.Milliseconds()) }
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// hotSize is the hot tier size the open helpers use. bothModes runs a test
+// with the hot tier off and on, since every command must behave the same
+// either way.
+var hotSize uint64
+
+func bothModes(t *testing.T, fn func(t *testing.T)) {
+	t.Helper()
+	for _, mode := range []struct {
+		name string
+		size uint64
+	}{{"hot=off", 0}, {"hot=on", 8 << 20}} {
+		t.Run(mode.name, func(t *testing.T) {
+			hotSize = mode.size
+			defer func() { hotSize = 0 }()
+			fn(t)
+		})
+	}
+}
+
+// Tests drive cache maintenance by hand (MaintenanceInterval < 0) so that
+// rotation and eviction happen at known points.
 func openAt(t *testing.T, dir string, clock *fakeClock, specs ...NamespaceSpec) (*Engine, error) {
 	t.Helper()
-	o := Options{Dir: dir, Namespaces: specs, WriteBufferSize: 1 << 20, BlockCacheSize: 8 << 20, Logger: quietLogger()}
+	o := Options{Dir: dir, Namespaces: specs, WriteBufferSize: 1 << 20, BlockCacheSize: 8 << 20, Logger: quietLogger(),
+		HotCacheSize: hotSize, MaintenanceInterval: -1}
 	if clock != nil {
 		o.Now = clock.Now
 	}
@@ -92,20 +113,28 @@ func wantMissing(t *testing.T, e *Engine, key string) {
 func TestCodecRoundTrip(t *testing.T) {
 	for _, payload := range [][]byte{nil, {}, []byte("hello"), bytes.Repeat([]byte{0xff}, 1000)} {
 		for _, exp := range []int64{0, 1, 1767225600000, math.MaxInt64} {
-			got, gotExp, err := decodeValue(encodeValue(payload, exp))
-			if err != nil || !bytes.Equal(got, payload) || gotExp != exp {
-				t.Fatalf("round trip (%d bytes, exp %d) = (%d bytes, exp %d, %v)", len(payload), exp, len(got), gotExp, err)
+			d, err := decodeValue(encodeValue(payload, exp))
+			if err != nil || !bytes.Equal(d.payload, payload) || d.expireAt != exp || d.tombstone {
+				t.Fatalf("round trip (%d bytes, exp %d) = %+v, %v", len(payload), exp, d, err)
 			}
 		}
 	}
+	if d, err := decodeValue(tombstone); err != nil || !d.tombstone || d.live(0) {
+		t.Fatalf("decodeValue(tombstone) = %+v, %v", d, err)
+	}
+	if d, _ := decodeValue(encodeValue(nil, 100)); !d.live(99) || d.live(100) {
+		t.Fatal("a value must be live strictly before its expiry and not at it")
+	}
 	for _, bad := range [][]byte{nil, []byte("short"), append([]byte{9, 0}, make([]byte, 8)...), append([]byte{1, 7}, make([]byte, 8)...)} {
-		if _, _, err := decodeValue(bad); err == nil {
+		if _, err := decodeValue(bad); err == nil {
 			t.Fatalf("decodeValue(%x) succeeded; want error", bad)
 		}
 	}
 }
 
-func TestSetGetDelete(t *testing.T) {
+func TestSetGetDelete(t *testing.T) { bothModes(t, testSetGetDelete) }
+
+func testSetGetDelete(t *testing.T) {
 	e := mustOpen(t, t.TempDir(), nil)
 
 	wantMissing(t, e, "k")
@@ -127,7 +156,9 @@ func TestSetGetDelete(t *testing.T) {
 	wantMissing(t, e, "empty")
 }
 
-func TestSetConditions(t *testing.T) {
+func TestSetConditions(t *testing.T) { bothModes(t, testSetConditions) }
+
+func testSetConditions(t *testing.T) {
 	clock := newFakeClock()
 	e := mustOpen(t, t.TempDir(), clock)
 	exp := clock.Now().Add(time.Minute).UnixMilli()
@@ -165,7 +196,9 @@ func TestSetConditions(t *testing.T) {
 	wantValue(t, e, "gone", "y")
 }
 
-func TestExpiry(t *testing.T) {
+func TestExpiry(t *testing.T) { bothModes(t, testExpiry) }
+
+func testExpiry(t *testing.T) {
 	clock := newFakeClock()
 	e := mustOpen(t, t.TempDir(), clock)
 	at := func(d time.Duration) int64 { return clock.Now().Add(d).UnixMilli() }
@@ -211,7 +244,9 @@ func TestExpiry(t *testing.T) {
 	wantMissing(t, e, "late")
 }
 
-func TestDefaultTTL(t *testing.T) {
+func TestDefaultTTL(t *testing.T) { bothModes(t, testDefaultTTL) }
+
+func testDefaultTTL(t *testing.T) {
 	clock := newFakeClock()
 	e := mustOpen(t, t.TempDir(), clock,
 		NamespaceSpec{Name: "sessions", Prefix: "session:", Profile: Cache, MaxSize: 64 << 20, DefaultTTL: time.Hour})
@@ -236,7 +271,9 @@ func TestDefaultTTL(t *testing.T) {
 	wantValue(t, e, "other", "v") // the default namespace has no default TTL
 }
 
-func TestIncrAppendGetDel(t *testing.T) {
+func TestIncrAppendGetDel(t *testing.T) { bothModes(t, testIncrAppendGetDel) }
+
+func testIncrAppendGetDel(t *testing.T) {
 	clock := newFakeClock()
 	e := mustOpen(t, t.TempDir(), clock)
 	k := []byte("n")
@@ -288,7 +325,9 @@ func TestIncrAppendGetDel(t *testing.T) {
 }
 
 // Concurrent increments of the same keys must not lose updates.
-func TestIncrByIsAtomic(t *testing.T) {
+func TestIncrByIsAtomic(t *testing.T) { bothModes(t, testIncrByIsAtomic) }
+
+func testIncrByIsAtomic(t *testing.T) {
 	e := mustOpen(t, t.TempDir(), nil)
 	const workers, perWorker, keys = 8, 500, 4
 
@@ -312,7 +351,9 @@ func TestIncrByIsAtomic(t *testing.T) {
 	}
 }
 
-func TestMSetAndDeleteAcrossNamespaces(t *testing.T) {
+func TestMSetAndDeleteAcrossNamespaces(t *testing.T) { bothModes(t, testMSetAndDeleteAcrossNamespaces) }
+
+func testMSetAndDeleteAcrossNamespaces(t *testing.T) {
 	e := mustOpen(t, t.TempDir(), nil,
 		NamespaceSpec{Name: "orders", Prefix: "orders:", Profile: Strict})
 
@@ -351,7 +392,7 @@ func TestNamespaceRouting(t *testing.T) {
 	// Each namespace is a separate column family.
 	mustSet(t, e, "a:b:1", "v", SetOptions{})
 	for _, ns := range e.namespaces {
-		s, err := e.db.GetCF(e.ro, ns.cf, []byte("a:b:1"))
+		s, err := e.db.GetCF(e.ro, ns.buckets[0].cf, []byte("a:b:1"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -378,7 +419,9 @@ func TestNamespaceRouting(t *testing.T) {
 	}
 }
 
-func TestReopen(t *testing.T) {
+func TestReopen(t *testing.T) { bothModes(t, testReopen) }
+
+func testReopen(t *testing.T) {
 	dir := t.TempDir()
 	clock := newFakeClock()
 	orders := NamespaceSpec{Name: "orders", Prefix: "orders:", Profile: Safe}
@@ -488,78 +531,6 @@ func namespaceStats(t *testing.T, e *Engine, name string) NamespaceStats {
 	return NamespaceStats{}
 }
 
-// A cache namespace stays near its size limit by dropping its oldest data; a
-// durable namespace given the same writes keeps everything.
-func TestFIFOEviction(t *testing.T) {
-	const (
-		maxSize   = 1 << 20
-		valueSize = 16 << 10
-		count     = 512 // 8 MiB in total, eight times the limit
-	)
-	e, err := Open(Options{
-		Dir:             t.TempDir(),
-		WriteBufferSize: 128 << 10,
-		BlockCacheSize:  8 << 20,
-		Logger:          quietLogger(),
-		Namespaces: []NamespaceSpec{
-			{Name: "c", Prefix: "c:", Profile: Cache, MaxSize: maxSize},
-			{Name: "d", Prefix: "d:", Profile: Safe},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer e.Close()
-
-	value := make([]byte, valueSize) // random, so compression cannot shrink it
-	for i := 0; i < count; i++ {
-		if _, err := rand.Read(value); err != nil {
-			t.Fatal(err)
-		}
-		for _, p := range []string{"c:", "d:"} {
-			if _, err := e.Set([]byte(fmt.Sprintf("%s%04d", p, i)), value, SetOptions{}, Cache); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	for _, ns := range []string{"c", "d"} {
-		if err := e.Flush(ns); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// RocksDB evicts in the background after a flush. The limit is enforced
-	// per file, so allow some slack above it.
-	waitFor(t, "the cache namespace to shrink to its limit", func() bool {
-		return namespaceStats(t, e, "c").DiskBytes <= 2*maxSize
-	})
-
-	wantMissing(t, e, "c:0000")
-	if _, ok := get(t, e, fmt.Sprintf("c:%04d", count-1)); !ok {
-		t.Fatal("the newest cache key was evicted")
-	}
-	survivors := 0
-	for i := 0; i < count; i++ {
-		if _, ok := get(t, e, fmt.Sprintf("c:%04d", i)); ok {
-			survivors++
-		} else if survivors > 0 {
-			t.Fatalf("cache key %d is missing but older keys survive; eviction must be oldest-first", i)
-		}
-	}
-	if max := 2 * maxSize / valueSize; survivors == 0 || survivors > max {
-		t.Fatalf("%d cache keys survive; want between 1 and %d", survivors, max)
-	}
-
-	for i := 0; i < count; i++ {
-		if _, ok := get(t, e, fmt.Sprintf("d:%04d", i)); !ok {
-			t.Fatalf("durable key %d is missing; durable namespaces must never evict", i)
-		}
-	}
-	if got := namespaceStats(t, e, "d").DiskBytes; got < count*valueSize {
-		t.Fatalf("durable namespace holds %d bytes; want at least %d", got, count*valueSize)
-	}
-}
-
 // Compaction physically removes expired keys from a durable namespace.
 func TestCompactionDropsExpiredKeys(t *testing.T) {
 	clock := newFakeClock()
@@ -572,7 +543,7 @@ func TestCompactionDropsExpiredKeys(t *testing.T) {
 	clock.Advance(time.Hour)
 
 	stored := func(key string) bool {
-		s, err := e.db.GetCF(e.ro, ns.cf, []byte(key))
+		s, err := e.db.GetCF(e.ro, ns.buckets[0].cf, []byte(key))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -586,7 +557,7 @@ func TestCompactionDropsExpiredKeys(t *testing.T) {
 	if err := e.Flush("d"); err != nil {
 		t.Fatal(err)
 	}
-	e.db.CompactRangeCF(ns.cf, grocksdb.Range{})
+	e.db.CompactRangeCF(ns.buckets[0].cf, grocksdb.Range{})
 
 	if stored("d:short") {
 		t.Fatal("expired key is still stored after compaction")

@@ -15,6 +15,8 @@ func TestParse(t *testing.T) {
 listen: "0.0.0.0:7000"
 data_dir: /var/lib/levelquorum
 block_cache_size: 4GB
+hot_cache_size: 0
+metrics_listen: "127.0.0.1:9380"
 max_bulk_size: 1048576
 namespaces:
   - name: sessions
@@ -34,6 +36,9 @@ namespaces:
 	}
 	if cfg.BlockCacheSize != 4<<30 || cfg.MaxBulkSize != 1<<20 {
 		t.Errorf("block_cache_size/max_bulk_size = %d, %d", cfg.BlockCacheSize, cfg.MaxBulkSize)
+	}
+	if cfg.HotCacheSize != 0 || cfg.MetricsListen != "127.0.0.1:9380" {
+		t.Errorf("hot_cache_size/metrics_listen = %d, %q; zero must be accepted, it disables the hot tier", cfg.HotCacheSize, cfg.MetricsListen)
 	}
 	if cfg.WriteBufferSize != Default().WriteBufferSize {
 		t.Errorf("write_buffer_size = %d; an omitted setting must keep its default", cfg.WriteBufferSize)
@@ -58,7 +63,7 @@ func TestParseEmptyIsDefault(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Parse(%q): %v", in, err)
 		}
-		if cfg.Listen != "127.0.0.1:6380" || len(cfg.Namespaces) != 0 {
+		if cfg.Listen != "127.0.0.1:6380" || len(cfg.Namespaces) != 0 || cfg.HotCacheSize != 128<<20 || cfg.MetricsListen != "" {
 			t.Errorf("Parse(%q) = %+v; want the defaults", in, cfg)
 		}
 	}

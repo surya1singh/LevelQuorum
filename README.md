@@ -8,8 +8,8 @@ It is built in Go on RocksDB. The goal is a cluster that holds terabytes at
 SSD prices; today it is a single node.
 
 - **Design:** [docs/DESIGN.md](docs/DESIGN.md)
-- **Status:** phase 1 of 5 is done (single node). Clustering, replication,
-  authentication and TLS are not implemented yet.
+- **Status:** phases 1 and 2 of 5 are done (a single node). Clustering,
+  replication, authentication and TLS are not implemented yet.
 
 ## Build
 
@@ -73,6 +73,11 @@ namespaces:
     profile: strict
 ```
 
+A cache namespace keeps what was written most recently, plus older keys
+that are still being read; it evicts the rest in steps of 1/16 of
+`max_size`. Leave about 15% of disk above `max_size` free for compaction
+and the write-ahead log.
+
 Keys that match no prefix go to the `default` namespace, a 1 GB cache unless
 you define it. See [levelquorum.example.yaml](levelquorum.example.yaml) for
 every setting, and the design document for what the profiles will mean once
@@ -80,6 +85,26 @@ there are replicas.
 
 A connection can raise the durability of its own writes with
 `DURABILITY strict`.
+
+## Memory
+
+Two settings decide how much RAM the server uses for data:
+
+- `hot_cache_size` (default 128MB): recently used values, served without
+  touching the database. `0` turns it off.
+- `block_cache_size` (default 256MB): RocksDB's cache of what it reads from
+  disk, including its indexes and bloom filters. For large data sets make
+  this 2-5% of the data size.
+
+On top of that, each namespace buffers up to about twice
+`write_buffer_size` (default 64MB) of recent writes in RAM.
+
+## Metrics
+
+Set `metrics_listen: "127.0.0.1:9380"` to serve Prometheus metrics at
+`/metrics`: command counts, errors and latency histograms, namespace sizes,
+evictions, and hot-cache hit rates. `INFO` reports the same figures to
+Redis clients. The endpoint has no authentication.
 
 ## Supported commands
 
@@ -104,8 +129,9 @@ go test -race ./...
 ```
 cmd/levelquorum     the server binary
 internal/storage    RocksDB engine: namespaces, expiry, eviction, durability
+internal/hotcache   RAM tier for recently used values
 internal/resp       Redis wire protocol
-internal/server     connections and commands
+internal/server     connections, commands and metrics
 internal/config     configuration file
 docs/DESIGN.md      design, including the cluster plan
 ```

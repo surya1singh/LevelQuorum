@@ -3,13 +3,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/surya1singh/LevelQuorum/internal/config"
 	"github.com/surya1singh/LevelQuorum/internal/server"
@@ -59,6 +62,7 @@ func run() error {
 		Dir:             cfg.DataDir,
 		Namespaces:      specs,
 		BlockCacheSize:  uint64(cfg.BlockCacheSize),
+		HotCacheSize:    uint64(cfg.HotCacheSize),
 		WriteBufferSize: uint64(cfg.WriteBufferSize),
 		Logger:          log,
 	})
@@ -78,6 +82,21 @@ func run() error {
 	srv := server.New(eng, server.Options{MaxBulkSize: int(cfg.MaxBulkSize), Logger: log})
 	log.Info("listening", "addr", ln.Addr().String(), "data_dir", cfg.DataDir, "version", server.Version)
 
+	var metrics *http.Server
+	if cfg.MetricsListen != "" {
+		mln, err := net.Listen("tcp", cfg.MetricsListen)
+		if err != nil {
+			ln.Close()
+			eng.Close()
+			return fmt.Errorf("metrics_listen: %w", err)
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", srv.MetricsHandler())
+		metrics = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go metrics.Serve(mln)
+		log.Info("serving metrics", "addr", mln.Addr().String(), "path", "/metrics")
+	}
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	served := make(chan error, 1)
@@ -88,6 +107,13 @@ func run() error {
 	case sig := <-stop:
 		log.Info("shutting down", "signal", sig.String())
 	case serveErr = <-served:
+	}
+	// The metrics endpoint reads from the engine, so it stops first, and a
+	// request that is being answered is allowed to finish.
+	if metrics != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		metrics.Shutdown(ctx)
+		cancel()
 	}
 	srv.Shutdown()
 	if err := eng.Close(); err != nil {

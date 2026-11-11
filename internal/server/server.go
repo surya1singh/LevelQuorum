@@ -17,7 +17,7 @@ import (
 )
 
 // Version is reported by INFO and HELLO.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // DefaultMaxBulkSize is the largest key or value accepted when Options does
 // not set one.
@@ -38,6 +38,8 @@ type Server struct {
 	maxBulk int
 	started time.Time
 	nextID  atomic.Int64
+	// stats has one fixed entry per command, so it is read without locking.
+	stats map[string]*commandStats
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -60,6 +62,7 @@ func New(eng *storage.Engine, o Options) *Server {
 		log:     o.Logger,
 		maxBulk: o.MaxBulkSize,
 		started: time.Now(),
+		stats:   newStatsTable(),
 		conns:   make(map[net.Conn]struct{}),
 	}
 }
@@ -200,13 +203,17 @@ func (s *Server) dispatch(c *client, args [][]byte) {
 			fmt.Fprintf(&b, "'%.64s' ", a)
 		}
 		c.w.Error(fmt.Sprintf("ERR unknown command '%.64s', with args beginning with: %s", args[0], b.String()))
+		s.stats[unknownCommand].observe(0, true)
 		return
 	}
+	errorsBefore := c.w.ErrorCount()
+	start := time.Now()
 	if (cmd.arity > 0 && len(args) != cmd.arity) || (cmd.arity < 0 && len(args) < -cmd.arity) {
 		c.wrongArgs(name)
-		return
+	} else {
+		cmd.fn(c, args)
 	}
-	cmd.fn(c, args)
+	s.stats[name].observe(time.Since(start), c.w.ErrorCount() != errorsBefore)
 }
 
 func (c *client) wrongArgs(name string) {

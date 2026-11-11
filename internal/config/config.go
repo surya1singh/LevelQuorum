@@ -26,10 +26,16 @@ type Config struct {
 	DataDir string `yaml:"data_dir"`
 	// BlockCacheSize is the RAM for RocksDB's cache of data blocks.
 	BlockCacheSize Size `yaml:"block_cache_size"`
+	// HotCacheSize is the RAM for recently used values, which are served
+	// without reading the database. Zero disables it.
+	HotCacheSize Size `yaml:"hot_cache_size"`
 	// WriteBufferSize is the in-memory write buffer per namespace.
 	WriteBufferSize Size `yaml:"write_buffer_size"`
 	// MaxBulkSize is the largest key or value a client may send.
 	MaxBulkSize Size `yaml:"max_bulk_size"`
+	// MetricsListen is the TCP address to serve Prometheus metrics on, at
+	// /metrics. Empty disables it.
+	MetricsListen string `yaml:"metrics_listen"`
 	// Namespaces maps key prefixes to storage profiles.
 	Namespaces []Namespace `yaml:"namespaces"`
 }
@@ -50,6 +56,7 @@ func Default() Config {
 		Listen:          "127.0.0.1:6380",
 		DataDir:         "data",
 		BlockCacheSize:  256 << 20,
+		HotCacheSize:    128 << 20,
 		WriteBufferSize: 64 << 20,
 		MaxBulkSize:     64 << 20,
 	}

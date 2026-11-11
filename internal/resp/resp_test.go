@@ -118,6 +118,9 @@ func TestWriter(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Fatal("replies reached the connection before Flush")
 	}
+	if got := w.ErrorCount(); got != 1 {
+		t.Fatalf("ErrorCount = %d; want 1", got)
+	}
 	if err := w.Flush(); err != nil {
 		t.Fatal(err)
 	}
